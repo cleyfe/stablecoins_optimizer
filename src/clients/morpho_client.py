@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Any
 
-from src.utils.morpho_utils import process_user_position, process_market_data, w_taylor_compounded, accrue_interests, to_assets_up, w_div_up, w_mul_down, w_div_down
+from src.utils.morpho_utils import accrue_interests, w_div_down, w_div_up, w_taylor_compounded, w_mul_down, to_assets_up, to_shares_down
 from src.utils.abi_references import ABIReference
 from src.utils.constants import SECONDS_PER_YEAR, WAD, ORACLE_PRICE_SCALE, MAX_UINT256, ZERO_ADDRESS
 from src.utils.morpho_markets import ETHEREUM_MORPHO_MARKETS, BASE_MORPHO_MARKETS
@@ -164,12 +164,12 @@ class MorphoClient:
         market_total_borrow = market_state_updated.total_borrow_assets 
         
         borrow_assets_user = to_assets_up(position_user.borrow_shares, market_state_updated.total_borrow_assets, market_state_updated.total_borrow_shares)
-        
-        utilization = 0 if market_total_borrow == 0 else w_div_up(market_total_borrow, market_state_updated.total_supply_assets)
+        if (market_params.irm != ZERO_ADDRESS):
+            utilization = 0 if market_total_borrow == 0 else w_div_up(market_total_borrow, market_state_updated.total_supply_assets)
+
         supply_apy = w_mul_down(w_mul_down(borrow_apy, (WAD - market_state.fee)), utilization)
 
         self.oracle_contract = self._get_oracle_contract(market_params.oracle)
-
         collateral_price = self.oracle_contract.functions.price().call()
         collateral = position_user.collateral
         max_borrow = w_mul_down(
@@ -214,13 +214,3 @@ class MorphoClient:
     def claim_rewards(self):
         # Implement rewards claiming if applicable
         pass
-
-    def get_user_position(self, user: str, asset: str) -> UserPosition:
-        # Fetch user position from Lens contract
-        raw_position = self.lens_contract.functions.getUserPosition(user, asset).call()
-        return process_user_position(raw_position)
-
-    def get_market_data(self, asset: str) -> MorphoMarket:
-        # Fetch market data from Lens contract
-        raw_market_data = self.lens_contract.functions.getMarketData(asset).call()
-        return process_market_data(raw_market_data)
