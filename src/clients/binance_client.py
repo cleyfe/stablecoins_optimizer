@@ -1,5 +1,5 @@
-# Client designed for basis trade implementation.
-# The basis trade is a delta-neutral strategy taking advantage from positive (or negative) funding rates
+# Client designed for basis trade implementation.
+# The basis trade is a delta-neutral strategy taking advantage from positive (or negative) funding rates
 
 import ccxt
 import pandas as pd
@@ -94,3 +94,55 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error fetching OHLCV data for {symbol}: {e}")
             return pd.DataFrame()
+
+    def fetch_spot_position(self, symbol: str) -> float:
+        """
+        Fetch spot position for a given symbol.
+        
+        :param symbol: Symbol string (e.g., 'BTC/USDT')
+        :return: Spot position amount
+        """
+        self.exchange.options['defaultType'] = 'spot'
+        try:
+            balance = self.exchange.fetch_balance()
+            return balance['total'].get(symbol.split('/')[0], 0)
+        except Exception as e:
+            logger.error(f"Error fetching spot position for {symbol}: {e}")
+            return 0
+
+    def fetch_futures_position(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetch futures position for a given symbol.
+        
+        :param symbol: Symbol string (e.g., 'BTC/USDT')
+        :return: Dictionary containing futures position details
+        """
+        self.exchange.options['defaultType'] = 'future'
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            return positions[0] if positions else None
+        except Exception as e:
+            logger.error(f"Error fetching futures position for {symbol}: {e}")
+            return None
+
+    def fetch_real_time_prices(self, symbol: str) -> Dict[str, float]:
+        """
+        Fetch real-time prices for both spot and futures markets.
+        
+        :param symbol: Symbol string (e.g., 'BTC/USDT')
+        :return: Dictionary with spot and futures prices
+        """
+        try:
+            self.exchange.options['defaultType'] = 'spot'
+            spot_ticker = self.exchange.fetch_ticker(symbol)
+            
+            self.exchange.options['defaultType'] = 'future'
+            future_ticker = self.exchange.fetch_ticker(symbol)
+            
+            return {
+                'spot': spot_ticker['last'],
+                'future': future_ticker['last']
+            }
+        except Exception as e:
+            logger.error(f"Error fetching real-time prices for {symbol}: {e}")
+            return {'spot': None, 'future': None}

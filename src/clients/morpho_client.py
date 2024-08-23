@@ -135,7 +135,6 @@ class MorphoClient:
         market_state = MarketState(*self.morpho_contract.functions.market(market_id).call())
         position_user = UserPosition(*self.morpho_contract.functions.position(market_id, user_address).call())
         print('market_params:', market_params)
-        print('market_state:', market_state)
         print('position_user:', position_user)
 
         market_params_tuple = (
@@ -156,7 +155,6 @@ class MorphoClient:
         )
 
         borrow_rate = self.irm_contract.functions.borrowRateView(market_params_tuple, market_state_tuple).call()
-        print("borrow_rate", borrow_rate)
         borrow_apy = w_taylor_compounded(borrow_rate, SECONDS_PER_YEAR)
         
         block = self.w3.eth.get_block('latest')
