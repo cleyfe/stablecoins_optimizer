@@ -10,6 +10,11 @@ import time
 from websocket import WebSocketApp
 import json
 import threading
+import hmac
+import hashlib
+import requests
+import urllib.parse
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -35,8 +40,8 @@ class BinanceClient:
         # Preload markets
         self.futures_markets = self.futures_exchange.load_markets()
         self.margin_markets = self.margin_exchange.load_markets()
-        self.margin_exchange.verbose = True
-        self.futures_exchange.verbose = True
+        #self.margin_exchange.verbose = True
+        #self.futures_exchange.verbose = True
 
         if self.verbose:
             logger.setLevel(logging.INFO)
@@ -284,49 +289,6 @@ class BinanceClient:
             logger.error(f"Error fetching cross margin balance: {str(e)}")
             return {}
 
-    def borrow_margin(self, code: str, amount: float, symbol: str) -> bool:
-        try:
-            # Fetch margin account information
-            margin_account = self.margin_exchange.fetch_balance({'type': 'margin'})
-            
-            # Check if we have enough borrowable amount
-            if code in margin_account and 'borrowFree' in margin_account[code]:
-                max_borrowable = float(margin_account[code]['borrowFree'])
-                if amount > max_borrowable:
-                    logger.warning(f"Requested borrow amount {amount} {code} exceeds max borrowable {max_borrowable} {code}. Adjusting to max borrowable.")
-                    amount = max_borrowable
-
-            # Use borrowCrossMargin to borrow
-            borrow_params = {
-                'portfolioMargin': True  # Set to True if using portfolio margin account
-            }
-            borrow_response = self.margin_exchange.borrowCrossMargin(code, amount, borrow_params)
-            
-            # Log the full response for debugging
-            logger.debug(f"Borrow response: {borrow_response}")
-            
-            # Check if the borrow was successful
-            if isinstance(borrow_response, dict) and 'tranId' in borrow_response:
-                logger.info(f"Successfully borrowed {amount} {code} for {symbol}. Transaction ID: {borrow_response['tranId']}")
-                return True
-            else:
-                logger.error(f"Unexpected borrow response format: {borrow_response}")
-                return False
-        except Exception as e:
-            logger.error(f"Error borrowing {amount} {code} for {symbol}: {str(e)}")
-            logger.error(f"Error details: {type(e).__name__}, {str(e)}")
-            return False
-
-    def repay_margin(self, code: str, amount: float, symbol: str) -> bool:
-        try:
-            margin_symbol = self.margin_exchange.fetch_ticker(symbol)['symbol']
-            self.margin_exchange.repayCrossMargin(code, amount, margin_symbol)
-            logger.info(f"Successfully repaid {amount} {code} for {symbol}")
-            return True
-        except Exception as e:
-            logger.error(f"Error repaying {amount} {code} for {symbol}: {str(e)}")
-            return False
-
     def fetch_borrow_rate(self, code: str) -> float:
         try:
             borrow_rate = self.margin_exchange.fetchCrossBorrowRate(code)
@@ -504,7 +466,7 @@ class BinanceClient:
                         initial_spread = positions[symbol]['spread']
                         profit = abs(initial_spread - basis_spread_percentage)
                         logger.info(f"\nEXIT POINT for {symbol}: Spread narrowed. Spread: {spread_info}")
-                        logger.info(f"Potential profit for {symbol}: {profit*100:.4f}%")
+                        logger.info(f"Potential profit for {symbol}: {profit:.4f}%")
                         if execute_trades:
                             success = self.execute_trade(symbol, trade_amount_usd, spread_info, is_entry=False, 
                                                         current_position=positions[symbol]['direction'])
@@ -528,8 +490,8 @@ class BinanceClient:
                     current_position: str = None, slippage: float = 0.001, retry_delay: int = 5, max_retries: int = 3):
         for attempt in range(max_retries):
             try:
-                self.check_api_permissions()
-                self.check_margin_account_type()
+                #self.check_api_permissions()
+                #self.check_accounts()
                 
                 margin_symbol = self.margin_exchange.fetch_ticker(symbol)['symbol']
                 futures_symbol = self.futures_exchange.fetch_ticker(symbol)['symbol']
@@ -588,18 +550,12 @@ class BinanceClient:
                 else:
                     # Exit trade logic
                     if current_position == 'long_futures':
-                        margin_order = self.margin_exchange.create_limit_sell_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
+                        margin_order = self.margin_exchange.create_limit_buy_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
                         futures_order = self.futures_exchange.create_limit_sell_order(futures_symbol, quantity, futures_limit_price)
                         # Repay borrowed asset if any
-                        self.repay_margin(base_asset, quantity, margin_symbol)
+                        self.direct_repay_margin(base_asset, quantity, margin_symbol)
                     elif current_position == 'short_futures':
-                        # Borrow asset for short selling on margin
-                        borrow_amount = float(quantity)
-                        logger.info(f"Attempting to borrow {borrow_amount} {base_asset} for short selling")
-                        if not self.borrow_margin(base_asset, borrow_amount, margin_symbol):
-                            logger.error(f"Failed to borrow {borrow_amount} {base_asset} for short selling. Skipping trade.")
-                            return False
-                        margin_order = self.margin_exchange.create_limit_buy_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
+                        margin_order = self.margin_exchange.create_limit_sell_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
                         futures_order = self.futures_exchange.create_limit_buy_order(futures_symbol, quantity, futures_limit_price)
                     else:
                         logger.error(f"Invalid current_position value: {current_position}")
@@ -716,28 +672,110 @@ class BinanceClient:
 
     def direct_borrow_margin(self, asset: str, amount: float):
         try:
+            base_url = "https://api.binance.com"
+            endpoint = "/sapi/v1/margin/borrow-repay"
+            timestamp = int(time.time() * 1000)
+            
+            # Prepare parameters
             params = {
                 'asset': asset,
-                'amount': str(amount),  # Binance expects the amount as a string
+                'amount': str(amount),
+                'isIsolated': 'FALSE',
+                'type': 'BORROW',
+                'timestamp': str(timestamp)
             }
-            response = self.margin_exchange.private_post_margin_loan(params)
-            logger.info(f"Direct margin borrow response: {response}")
-            return True
+
+            # Create the query string
+            query_string = '&'.join([f"{k}={urllib.parse.quote(str(v))}" for k, v in sorted(params.items())])
+
+            # Get the API key and secret
+            api_key = self.margin_exchange.apiKey
+            api_secret = self.margin_exchange.secret
+
+            # Create the signature
+            signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            # Add the signature to the query string
+            full_url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+
+            # Prepare headers
+            headers = {
+                'X-MBX-APIKEY': api_key
+            }
+
+            # Make the request
+            response = requests.post(full_url, headers=headers)
+
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Direct margin borrow response: {result}")
+                if 'tranId' in result:
+                    logger.info(f"Borrow transaction ID: {result['tranId']}")
+                    return True
+                else:
+                    logger.warning("Unexpected response format. No transaction ID found.")
+                    return False
+            else:
+                logger.error(f"Error in direct margin borrow: {response.text}")
+                return False
+
         except Exception as e:
             logger.error(f"Error in direct margin borrow: {str(e)}")
             return False
 
-    def check_margin_account_type(self):
+    def direct_repay_margin(self, asset: str, amount: float):
         try:
-            response = self.margin_exchange.private_get_margin_account()
-            logger.info(f"Margin account info: {response}")
-            if 'marginLevel' in response:
-                logger.info("Using cross-margin account")
-            else:
-                logger.warning("Not using cross-margin account")
-        except Exception as e:
-            logger.error(f"Error checking margin account type: {str(e)}")
+            base_url = "https://api.binance.com"
+            endpoint = "/sapi/v1/margin/borrow-repay"
+            timestamp = int(time.time() * 1000)
+            
+            # Prepare parameters
+            params = {
+                'asset': asset,
+                'amount': str(amount),
+                'isIsolated': 'FALSE',
+                'type': 'REPAY',
+                'timestamp': str(timestamp)
+            }
 
+            # Create the query string
+            query_string = '&'.join([f"{k}={urllib.parse.quote(str(v))}" for k, v in sorted(params.items())])
+
+            # Get the API key and secret
+            api_key = self.margin_exchange.apiKey
+            api_secret = self.margin_exchange.secret
+
+            # Create the signature
+            signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            # Add the signature to the query string
+            full_url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+
+            # Prepare headers
+            headers = {
+                'X-MBX-APIKEY': api_key
+            }
+
+            # Make the request
+            response = requests.post(full_url, headers=headers)
+
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Direct margin borrow response: {result}")
+                if 'tranId' in result:
+                    logger.info(f"Borrow transaction ID: {result['tranId']}")
+                    return True
+                else:
+                    logger.warning("Unexpected response format. No transaction ID found.")
+                    return False
+            else:
+                logger.error(f"Error in direct margin borrow: {response.text}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error in direct margin borrow: {str(e)}")
+            return False
+        
     def check_api_permissions(self):
         try:
             response = self.margin_exchange.private_get_account()
@@ -748,4 +786,5 @@ class BinanceClient:
             else:
                 logger.warning("API key does not have margin trading permission")
         except Exception as e:
-            logger.error(f"Error checking API permissions: {str(e)}")            
+            logger.error(f"Error checking API permissions: {str(e)}")    
+          
