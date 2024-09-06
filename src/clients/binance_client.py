@@ -4,6 +4,8 @@
 import ccxt
 import pandas as pd
 from typing import List, Dict, Any
+from decimal import Decimal, InvalidOperation
+import traceback
 from datetime import datetime, timedelta
 import logging
 import time
@@ -222,6 +224,16 @@ class BinanceClient:
             logger.error(f"Error fetching futures position for {symbol}: {e}")
             return None
 
+    def fetch_futures_prices(self, futures_symbols: List[str]) -> Dict[str, float]:
+        """
+        Fetch the latest futures prices for the given symbols.
+        """
+        prices = {}
+        for symbol in futures_symbols:
+            ticker = self.futures_exchange.fetch_ticker(symbol)
+            prices[symbol] = ticker['last']
+        return prices
+
 
     def fetch_real_time_prices(self, symbol: str) -> Dict[str, float]:
         """
@@ -261,7 +273,6 @@ class BinanceClient:
             logger.error(f"Error fetching minute-level spot prices for {symbol}: {e}")
             return pd.DataFrame()
 
-
     def fetch_minute_futures_prices(self, symbol: str, limit: int = 1000) -> pd.DataFrame:
         """
         Fetch futures prices at 1-minute intervals for a given symbol.
@@ -298,7 +309,6 @@ class BinanceClient:
             logger.error(f"Error fetching borrow rate for {code}: {str(e)}")
             return None
 
-
     def get_margin_balance(self) -> float:
         try:
             cross_margin_account = self.margin_exchange.fetch_balance({'type': 'margin'})
@@ -331,8 +341,7 @@ class BinanceClient:
         merged_df['basis_spread'] = (merged_df['close_futures'] - merged_df['close_spot']) / merged_df['close_spot']
         merged_df['basis_spread_percentage'] = merged_df['basis_spread'] * 100
         
-        return merged_df
-    
+        return merged_df  
 
     def start_websocket_streams(self, symbols: List[str]):
         """
@@ -400,9 +409,9 @@ class BinanceClient:
     def on_close(self, ws, close_status_code, close_msg):
         logger.info("WebSocket connection closed")
 
-    def monitor_basis_spreads(self, symbols: List[str], entry_threshold: float = 0.001, exit_threshold: float = 0.001, 
+    def monitor_basis_spreads(self, symbols: List[str], entry_threshold: float = 0.004, exit_threshold: float = 0.0005, 
                               interval: int = 5, update_interval: int = 300, log_all_prices: bool = False,
-                              execute_trades: bool = False, trade_amount_usd: float = 0.0):
+                              execute_trades: bool = False, trade_amount_usd: float = 0.0, slippage: float = 0.0005):
         """
         Monitor basis spreads for multiple symbols, log potential entry and exit points, and optionally execute trades.
         
@@ -438,7 +447,6 @@ class BinanceClient:
                     if spread_info:
                         logger.info(f"{symbol}: {spread_info['basis_spread_percentage']:.4f}%")
                 last_update_time = current_time
-                logger.info("")  # Add an empty line for better readability
 
             for symbol in symbols:
                 spread_info = self.get_latest_basis_spread(symbol)
@@ -450,33 +458,39 @@ class BinanceClient:
                                     f"Futures: {spread_info['futures_price']:.8f}, "
                                     f"Spread %: {basis_spread_percentage:.8f}%")
 
+                    # Entries and Exits
+                    # Entry logic
                     if abs(basis_spread_percentage) > (entry_threshold * 100) and positions[symbol]['spread'] is None:
                         logger.info(f"\nENTRY POINT for {symbol}: "
                                     f"{'Futures much higher than margin' if basis_spread_percentage > 0 else 'Margin much higher than futures'}. "
                                     f"Spread: {spread_info}")
                         if execute_trades:
-                            success = self.execute_trade(symbol, trade_amount_usd, spread_info, is_entry=True)
+                            success = self.execute_trade(symbol, trade_amount_usd, spread_info, is_entry=True, slippage=slippage)
                             if success:
                                 positions[symbol]['spread'] = basis_spread_percentage
                                 positions[symbol]['direction'] = 'long_futures' if basis_spread_percentage > 0 else 'short_futures'
                         else:
                             positions[symbol]['spread'] = basis_spread_percentage
                             positions[symbol]['direction'] = 'long_futures' if basis_spread_percentage > 0 else 'short_futures'
-                    elif abs(basis_spread_percentage) < (exit_threshold * 100) and positions[symbol]['spread'] is not None:
-                        initial_spread = positions[symbol]['spread']
-                        profit = abs(initial_spread - basis_spread_percentage)
-                        logger.info(f"\nEXIT POINT for {symbol}: Spread narrowed. Spread: {spread_info}")
-                        logger.info(f"Potential profit for {symbol}: {profit:.4f}%")
-                        if execute_trades:
-                            success = self.execute_trade(symbol, trade_amount_usd, spread_info, is_entry=False, 
-                                                        current_position=positions[symbol]['direction'])
-                            if success:
-                                positions[symbol]['spread'] = None
-                                positions[symbol]['direction'] = None
-                            else:
-                                positions[symbol]['spread'] = None
-                                positions[symbol]['direction'] = None
-                                
+                    
+                    # Exit logic
+                    elif positions[symbol]['spread'] is not None:
+                        if (positions[symbol]['direction'] == 'long_futures' and basis_spread_percentage < (exit_threshold * 100)) or \
+                            (positions[symbol]['direction'] == 'short_futures' and basis_spread_percentage > -(exit_threshold * 100)):
+                                initial_spread = positions[symbol]['spread']
+                                profit = abs(initial_spread - basis_spread_percentage)
+                                logger.info(f"\nEXIT POINT for {symbol}: Spread narrowed. Spread: {spread_info}")
+                                logger.info(f"Potential profit for {symbol}: {profit:.4f}%")
+                
+                                if execute_trades:
+                                    success = self.execute_trade(symbol, trade_amount_usd, spread_info, is_entry=False, 
+                                                                current_position=positions[symbol]['direction'], slippage=slippage)
+                                    if success:
+                                        positions[symbol]['spread'] = None
+                                        positions[symbol]['direction'] = None
+                                    else:
+                                        pass
+       
             if not log_all_prices:
                 check_count += 1
                 if check_count % 2 == 0:
@@ -487,24 +501,18 @@ class BinanceClient:
             time.sleep(interval)
 
     def execute_trade(self, symbol: str, amount_usd: float, spread_info: Dict, is_entry: bool = True, 
-                    current_position: str = None, slippage: float = 0.001, retry_delay: int = 5, max_retries: int = 3):
+                        current_position: str = None, slippage: float = 0.0005, retry_delay: int = 5, max_retries: int = 3):
+        borrowed_amount = 0
         for attempt in range(max_retries):
             try:
-                #self.check_api_permissions()
-                #self.check_accounts()
-                
                 margin_symbol = self.margin_exchange.fetch_ticker(symbol)['symbol']
                 futures_symbol = self.futures_exchange.fetch_ticker(symbol)['symbol']
-                base_asset = symbol.split('USDT')[0]
-
-                # Fetch market info
-                margin_market = self.margin_markets[margin_symbol]
-                futures_market = self.futures_markets[futures_symbol]
+                base_asset = symbol.split('USDT')[0] if 'USDT' in symbol else symbol.split('USDC')[0]
 
                 # Check available balance
                 margin_balance = self.get_cross_margin_balance()
                 futures_balance = self.futures_exchange.fetch_balance()['USDT']['free']
-                
+
                 logger.info(f"Attempting trade for {symbol}. Amount: {amount_usd} USDT")
                 logger.info(f"Available balance - Cross Margin: {margin_balance['USDT']['free']} USDT, Futures: {futures_balance} USDT")
 
@@ -512,19 +520,26 @@ class BinanceClient:
                 margin_price = spread_info['margin_price']
                 futures_price = spread_info['futures_price']
 
-                # Calculate the quantity to trade based on the USD amount
-                quantity = amount_usd / ((margin_price + futures_price) / 2)
+                if is_entry:
+                    quantity = self.margin_exchange.amount_to_precision(margin_symbol, amount_usd / ((margin_price + futures_price) / 2))                
+                    logger.info(f"Trade quantity: {quantity}")
+                else:
+                    # For exit trades, fetch both margin and futures positions
+                    margin_positions = self.margin_exchange.fetch_positions([margin_symbol])
+                    futures_positions = self.futures_exchange.fetch_positions([futures_symbol])
 
-                # Adjust quantity to respect the market's precision
-                quantity = self.margin_exchange.amount_to_precision(margin_symbol, quantity)
+                    margin_quantity = abs(float(margin_positions[0]['amount'])) if margin_positions else 0
+                    futures_quantity = abs(float(futures_positions[0]['amount'])) if futures_positions else 0
 
-                logger.info(f"Calculated trade quantity: {quantity} {base_asset}")
+                    if margin_quantity == 0 or futures_quantity == 0:
+                        logger.warning(f"No open position found for {symbol}. Skipping trade.")
+                        return False
 
-                # Calculate limit order prices
+                    logger.info(f"Trade quantities - Margin: {margin_quantity}, Futures: {futures_quantity}")
+
                 margin_limit_price = margin_price * (1 + slippage if futures_price > margin_price else 1 - slippage)
                 futures_limit_price = futures_price * (1 - slippage if futures_price > margin_price else 1 + slippage)
 
-                # Adjust prices to respect the market's precision
                 margin_limit_price = self.margin_exchange.price_to_precision(margin_symbol, margin_limit_price)
                 futures_limit_price = self.futures_exchange.price_to_precision(futures_symbol, futures_limit_price)
 
@@ -533,63 +548,91 @@ class BinanceClient:
                 # Set leverage for futures trade
                 self.futures_exchange.set_leverage(self.leverage, futures_symbol)
 
-                # Place orders
+                order_type = 'limit'
                 if is_entry:
-                    if margin_price > futures_price:
+                    if margin_price > futures_price and borrowed_amount == 0:
                         # Borrow asset for short selling on margin
                         borrow_amount = float(quantity)
                         logger.info(f"Attempting to borrow {borrow_amount} {base_asset} for short selling")
-                        if not self.direct_borrow_margin(base_asset, borrow_amount):
+                        if not self.direct_margin_transaction(base_asset, borrow_amount, 'borrow'):
                             logger.error(f"Failed to borrow {borrow_amount} {base_asset} for short selling. Skipping trade.")
                             return False
-                        margin_order = self.margin_exchange.create_limit_sell_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
-                        futures_order = self.futures_exchange.create_limit_buy_order(futures_symbol, quantity, futures_limit_price)
+                        borrowed_amount = borrow_amount
+                        margin_order = self.margin_exchange.create_order(margin_symbol, order_type, 'sell', quantity, margin_limit_price, {'marginMode': 'cross'})                        
+                        futures_order = self.futures_exchange.create_order(futures_symbol, order_type, 'buy', quantity, futures_limit_price)
                     else:
-                        margin_order = self.margin_exchange.create_limit_buy_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
-                        futures_order = self.futures_exchange.create_limit_sell_order(futures_symbol, quantity, futures_limit_price)
+                        margin_order = self.margin_exchange.create_order(margin_symbol, order_type, 'buy', margin_quantity, margin_limit_price, {'marginMode': 'cross'})
+                        futures_order = self.futures_exchange.create_order(futures_symbol, order_type, 'sell', futures_quantity, futures_limit_price)
                 else:
                     # Exit trade logic
                     if current_position == 'long_futures':
-                        margin_order = self.margin_exchange.create_limit_buy_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
-                        futures_order = self.futures_exchange.create_limit_sell_order(futures_symbol, quantity, futures_limit_price)
+                        margin_order = self.margin_exchange.create_order(margin_symbol, order_type, 'buy', margin_quantity, margin_limit_price, {'marginMode': 'cross'})
+                        futures_order = self.futures_exchange.create_order(futures_symbol, order_type, 'sell', futures_quantity, futures_limit_price)
                         # Repay borrowed asset if any
-                        self.direct_repay_margin(base_asset, quantity, margin_symbol)
+                        if borrowed_amount > 0:
+                            self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+                            borrowed_amount = 0
                     elif current_position == 'short_futures':
-                        margin_order = self.margin_exchange.create_limit_sell_order(margin_symbol, quantity, margin_limit_price, {'marginMode': 'cross'})
-                        futures_order = self.futures_exchange.create_limit_buy_order(futures_symbol, quantity, futures_limit_price)
-                    else:
-                        logger.error(f"Invalid current_position value: {current_position}")
-                        return False
+                        margin_order = self.margin_exchange.create_order(margin_symbol, order_type, 'sell', margin_quantity, margin_limit_price, {'marginMode': 'cross'})
+                        futures_order = self.futures_exchange.create_order(futures_symbol, order_type, 'buy', futures_quantity, futures_limit_price)
 
-                logger.info(f"Cross margin order placed: {margin_order}")
-                logger.info(f"Futures order placed: {futures_order}")
+                logger.info(f"Placed {'entry' if is_entry else 'exit'} orders - Margin: {margin_order}, Futures: {futures_order}")
 
-                # Check if both orders are filled (wait for up to 30 seconds)
-                for _ in range(30):
+                # Check if both orders are filled (wait for up to 10 seconds)
+                start_time = time.time()
+                while time.time() - start_time < 10:
                     margin_order = self.margin_exchange.fetch_order(margin_order['id'], margin_symbol)
                     futures_order = self.futures_exchange.fetch_order(futures_order['id'], futures_symbol)
-                    
+
                     if margin_order['status'] == 'closed' and futures_order['status'] == 'closed':
-                        logger.info(f"Basis trade executed successfully for {symbol}")
+                        logger.info(f"Basis trade {'entry' if is_entry else 'exit'} executed successfully for {symbol}")
                         return True
-                    elif margin_order['status'] == 'canceled' or futures_order['status'] == 'canceled':
+
+                    if margin_order['status'] == 'canceled' or futures_order['status'] == 'canceled':
                         logger.warning(f"One of the orders was canceled. Margin: {margin_order['status']}, Futures: {futures_order['status']}")
                         break
-                    
-                    time.sleep(1)
 
-                # If orders are not filled after 30 seconds, cancel them
+                    time.sleep(0.5)
+
+                # If orders are not filled after 10 seconds, cancel them and handle partial fills
+                margin_filled = float(margin_order['filled'])
+                futures_filled = float(futures_order['filled'])
+
                 if margin_order['status'] not in ['closed', 'canceled']:
                     self.margin_exchange.cancel_order(margin_order['id'], margin_symbol)
                 if futures_order['status'] not in ['closed', 'canceled']:
                     self.futures_exchange.cancel_order(futures_order['id'], futures_symbol)
 
-                logger.warning(f"Orders not filled within timeout or were canceled for {symbol}")
-                return False
+                logger.warning(f"Orders not fully filled within timeout. Margin filled: {margin_filled}, Futures filled: {futures_filled}")
+
+                # Handle partial fills
+                if margin_filled > 0 or futures_filled > 0:
+                    logger.info("Handling partial fills...")
+                    if margin_filled > futures_filled:
+                        # Close excess margin position
+                        excess = margin_filled - futures_filled
+                        self.close_partial_position(margin_symbol, 'margin', excess, margin_order['side'] == 'buy')
+                    elif futures_filled > margin_filled:
+                        # Close excess futures position
+                        excess = futures_filled - margin_filled
+                        self.close_partial_position(futures_symbol, 'futures', excess, futures_order['side'] == 'buy')
+
+                # If entry trade failed and we borrowed, repay the borrowed amount
+                if is_entry and borrowed_amount > 0:
+                    repay_amount = borrowed_amount if margin_filled == 0 else borrowed_amount - margin_filled
+                    if repay_amount > 0:
+                        self.direct_margin_transaction(base_asset, repay_amount, 'repay')
+                    borrowed_amount = 0
+
+                return margin_filled > 0 and futures_filled > 0
 
             except Exception as e:
                 logger.error(f"Error executing basis trade for {symbol}: {str(e)}")
                 logger.error(f"Error details: {type(e).__name__}, {str(e)}")
+                # If we borrowed and an exception occurred, make sure to repay
+                if borrowed_amount > 0:
+                    self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+                    borrowed_amount = 0
 
             if attempt < max_retries - 1:
                 logger.info(f"Retrying in {retry_delay} seconds...")
@@ -597,6 +640,20 @@ class BinanceClient:
 
         logger.error(f"Failed to execute basis trade for {symbol} after {max_retries} attempts")
         return False
+
+    def close_partial_position(self, symbol: str, market_type: str, amount: float, is_long: bool):
+        try:
+            order_type = 'market'
+            side = 'sell' if is_long else 'buy'
+            
+            if market_type == 'margin':
+                order = self.margin_exchange.create_order(symbol, order_type, side, amount, None, {'marginMode': 'cross'})
+            else:  # futures
+                order = self.futures_exchange.create_order(symbol, order_type, side, amount)
+            
+            logger.info(f"Closed partial {market_type} position: {order}")
+        except Exception as e:
+            logger.error(f"Error closing partial {market_type} position: {str(e)}")
 
     def get_latest_basis_spread(self, symbol: str) -> Dict:
         """
@@ -669,8 +726,7 @@ class BinanceClient:
         else:
             self.spot_exchange.cancel_order(order_id, symbol)
 
-
-    def direct_borrow_margin(self, asset: str, amount: float):
+    def direct_margin_transaction(self, asset: str, amount: float, direction: str):
         try:
             base_url = "https://api.binance.com"
             endpoint = "/sapi/v1/margin/borrow-repay"
@@ -681,7 +737,7 @@ class BinanceClient:
                 'asset': asset,
                 'amount': str(amount),
                 'isIsolated': 'FALSE',
-                'type': 'BORROW',
+                'type': direction.upper(),
                 'timestamp': str(timestamp)
             }
 
@@ -708,74 +764,21 @@ class BinanceClient:
 
             if response.status_code == 200:
                 result = response.json()
-                logger.info(f"Direct margin borrow response: {result}")
+                logger.info(f"Direct margin {direction} response: {result}")
                 if 'tranId' in result:
-                    logger.info(f"Borrow transaction ID: {result['tranId']}")
+                    logger.info(f"{direction} transaction ID: {result['tranId']}")
                     return True
                 else:
                     logger.warning("Unexpected response format. No transaction ID found.")
                     return False
             else:
-                logger.error(f"Error in direct margin borrow: {response.text}")
+                logger.error(f"Error in direct margin {direction}: {response.text}")
                 return False
 
         except Exception as e:
-            logger.error(f"Error in direct margin borrow: {str(e)}")
+            logger.error(f"Error in direct margin {direction}: {str(e)}")
             return False
-
-    def direct_repay_margin(self, asset: str, amount: float):
-        try:
-            base_url = "https://api.binance.com"
-            endpoint = "/sapi/v1/margin/borrow-repay"
-            timestamp = int(time.time() * 1000)
-            
-            # Prepare parameters
-            params = {
-                'asset': asset,
-                'amount': str(amount),
-                'isIsolated': 'FALSE',
-                'type': 'REPAY',
-                'timestamp': str(timestamp)
-            }
-
-            # Create the query string
-            query_string = '&'.join([f"{k}={urllib.parse.quote(str(v))}" for k, v in sorted(params.items())])
-
-            # Get the API key and secret
-            api_key = self.margin_exchange.apiKey
-            api_secret = self.margin_exchange.secret
-
-            # Create the signature
-            signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-
-            # Add the signature to the query string
-            full_url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
-
-            # Prepare headers
-            headers = {
-                'X-MBX-APIKEY': api_key
-            }
-
-            # Make the request
-            response = requests.post(full_url, headers=headers)
-
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"Direct margin borrow response: {result}")
-                if 'tranId' in result:
-                    logger.info(f"Borrow transaction ID: {result['tranId']}")
-                    return True
-                else:
-                    logger.warning("Unexpected response format. No transaction ID found.")
-                    return False
-            else:
-                logger.error(f"Error in direct margin borrow: {response.text}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error in direct margin borrow: {str(e)}")
-            return False
-        
+     
     def check_api_permissions(self):
         try:
             response = self.margin_exchange.private_get_account()
@@ -787,4 +790,248 @@ class BinanceClient:
                 logger.warning("API key does not have margin trading permission")
         except Exception as e:
             logger.error(f"Error checking API permissions: {str(e)}")    
-          
+
+
+    def execute_triangular_arbitrage(self, symbols: List[str], trades: List[str], trade_amount_usd: float, 
+                                    prices: Dict[str, Decimal], max_slippage: float) -> bool:
+        """
+        Execute a triangular arbitrage trade using margin markets, starting with USD.
+        """
+        try:
+            current_amount_usd = Decimal(str(trade_amount_usd))
+            borrowed_amount = 0
+            base_asset = None
+
+            for i, (symbol, side) in enumerate(zip(symbols, trades)):
+                price = prices[symbol]
+                
+                if side == 'buy':
+                    # Convert USD to asset quantity
+                    quantity = float(current_amount_usd / price)
+                else:
+                    # For sell, use the current amount directly (it's already in the asset quantity)
+                    quantity = float(current_amount_usd)
+
+                # Apply leverage to the quantity
+                leveraged_quantity = quantity * self.leverage if i == 0 else quantity
+                
+                # Use exchange's precision
+                precise_quantity = self.margin_exchange.amount_to_precision(symbol, leveraged_quantity)
+
+                # Calculate limit price
+                limit_price = float(price) * (1 + max_slippage if side == 'buy' else 1 - max_slippage)
+                limit_price = self.margin_exchange.price_to_precision(symbol, limit_price)
+
+                logger.info(f"Executing trade: Symbol={symbol}, Side={side}, Quantity={precise_quantity}, Limit Price={limit_price}")
+
+                # Check if we need to borrow for a short sell
+                if side == 'sell' and i == 0:
+                    base_asset = symbol.split('/')[0]
+                    borrow_amount = float(precise_quantity)
+                    logger.info(f"Attempting to borrow {borrow_amount} {base_asset} for short selling")
+                    if not self.direct_margin_transaction(base_asset, borrow_amount, 'borrow'):
+                        logger.error(f"Failed to borrow {borrow_amount} {base_asset} for short selling. Skipping trade.")
+                        return False
+                    borrowed_amount = borrow_amount
+
+                # Execute the margin trade
+                try:
+                    order = self.margin_exchange.create_order(symbol, 'limit', side, precise_quantity, limit_price, {'marginMode': 'cross'})
+                    logger.info(f"Placed margin {side} order for {symbol}: {order}")
+                except Exception as e:
+                    logger.error(f"Error placing margin order: {str(e)}")
+                    logger.error(f"Order details: Symbol={symbol}, Side={side}, Quantity={precise_quantity}, Limit Price={limit_price}")
+                    if borrowed_amount > 0:
+                        self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+                    raise
+
+                # Wait for the order to be filled (with a timeout)
+                start_time = time.time()
+                while time.time() - start_time < 10:  # 10 seconds timeout
+                    order = self.margin_exchange.fetch_order(order['id'], symbol)
+                    if order['status'] == 'closed':
+                        break
+                    time.sleep(0.5)
+
+                if order['status'] != 'closed':
+                    logger.warning(f"Order not filled within timeout. Cancelling order.")
+                    self.margin_exchange.cancel_order(order['id'], symbol)
+                    if borrowed_amount > 0:
+                        self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+                    return False
+
+                # Update current_amount for the next trade
+                if side == 'buy':
+                    current_amount_usd = Decimal(str(order['filled']))  # This is now in asset quantity
+                else:
+                    current_amount_usd = Decimal(str(order['filled'])) * Decimal(str(order['average']))  # Convert back to USD
+
+            # Repay borrowed asset if any
+            if borrowed_amount > 0:
+                self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error executing margin triangular arbitrage: {str(e)}")
+            logger.error(f"Error details: {type(e).__name__}, {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            if borrowed_amount > 0:
+                self.direct_margin_transaction(base_asset, borrowed_amount, 'repay')
+            return False
+
+    def execute_margin_trade(self, symbol: str, side: str, amount: str) -> dict:
+        """
+        Execute a margin trade using direct Binance API calls.
+        """
+        try:
+            base_url = "https://api.binance.com"
+            endpoint = "/sapi/v1/margin/order"
+            timestamp = int(time.time() * 1000)
+
+            # Prepare parameters
+            params = {
+                'symbol': symbol.replace('/', ''),
+                'side': side.upper(),
+                'type': 'MARKET',
+                'quantity': amount,
+                'isIsolated': 'FALSE',  # for cross margin
+                'timestamp': str(timestamp)
+            }
+
+            # Create the query string
+            query_string = '&'.join([f"{k}={urllib.parse.quote(str(v))}" for k, v in sorted(params.items())])
+
+            # Create the signature
+            signature = hmac.new(self.margin_exchange.secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+            # Add the signature to the query string
+            full_url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+
+            # Prepare headers
+            headers = {
+                'X-MBX-APIKEY': self.margin_exchange.apiKey
+            }
+
+            # Make the request
+            response = requests.post(full_url, headers=headers)
+
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Error in margin trade execution: {response.text}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Error in margin trade execution: {str(e)}")
+            return None
+    
+    def monitor_triangular_arbitrage(self, symbol_triplet: List[str], trades: List[str],
+                                    profit_threshold: float = 0.001, 
+                                    interval: int = 5, update_interval: int = 300, 
+                                    execute_trades: bool = False, trade_amount: float = 100.0,
+                                    max_slippage: float = 0.001):
+        """
+        Monitor and potentially execute bidirectional triangular arbitrage opportunities using margin markets.
+        """
+        logger.info(f"Starting bidirectional margin triangular arbitrage monitoring for {symbol_triplet}")
+        logger.info(f"Initial trade sequence: {trades}")
+        logger.info(f"Settings: profit_threshold={profit_threshold}, interval={interval}, "
+                    f"update_interval={update_interval}, execute_trades={execute_trades}, "
+                    f"trade_amount={trade_amount}, max_slippage={max_slippage}, leverage={self.leverage}")
+
+        last_update_time = time.time()
+
+        while True:
+            current_time = time.time()
+
+            try:
+                # Fetch latest margin prices
+                prices = self.fetch_margin_prices(symbol_triplet)
+
+                # Calculate potential profit in both directions
+                forward_profit = self.calculate_triangular_arbitrage_profit(prices, trades, trade_amount)
+                reverse_trades = [self.reverse_trade(t) for t in trades[::-1]]
+                reverse_prices = {symbol: price for symbol, price in reversed(prices.items())}
+                reverse_profit = self.calculate_triangular_arbitrage_profit(reverse_prices, reverse_trades, trade_amount)
+
+                # Determine if there's a profitable opportunity in either direction
+                if abs(forward_profit) > profit_threshold * 100 or abs(reverse_profit) > profit_threshold * 100:
+                    if forward_profit > reverse_profit:
+                        logger.info(f"Forward arbitrage: {forward_profit:.4f}% profit")
+                        if execute_trades and forward_profit > profit_threshold * 100:
+                            success = self.execute_triangular_arbitrage(symbol_triplet, trades, trade_amount, prices, max_slippage)
+                            if success:
+                                logger.info("Forward margin triangular arbitrage trade executed successfully")
+                            else:
+                                logger.warning("Failed to execute forward margin triangular arbitrage trade")
+                    else:
+                        logger.info(f"Reverse arbitrage: {reverse_profit:.4f}% profit")
+                        if execute_trades and reverse_profit > profit_threshold * 100:
+                            success = self.execute_triangular_arbitrage(symbol_triplet[::-1], reverse_trades, trade_amount, prices, max_slippage)
+                            if success:
+                                logger.info("Reverse margin triangular arbitrage trade executed successfully")
+                            else:
+                                logger.warning("Failed to execute reverse margin triangular arbitrage trade")
+
+                # Print current arbitrage opportunities every update_interval
+                if current_time - last_update_time >= update_interval:
+                    logger.info(f"\nCurrent margin arbitrage opportunities at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:")
+                    logger.info(f"Forward potential profit: {forward_profit:.4f}%")
+                    logger.info(f"Reverse potential profit: {reverse_profit:.4f}%")
+                    logger.info(f"Prices: {prices}")
+                    last_update_time = current_time
+
+            except Exception as e:
+                logger.error(f"Error in bidirectional margin triangular arbitrage monitoring: {str(e)}")
+                logger.error(f"Traceback: {traceback.format_exc()}")
+
+            time.sleep(interval)
+            
+    def fetch_margin_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
+        """
+        Fetch the latest margin prices for the given symbol triplet.
+        """
+        prices = {}
+        for symbol in symbols:
+            try:
+                ticker = self.margin_exchange.fetch_ticker(symbol)
+                prices[symbol] = Decimal(str(ticker['last']))
+            except Exception as e:
+                logger.error(f"Error fetching price for {symbol}: {str(e)}")
+                raise
+        return prices
+
+    def reverse_trade(self, trade: str) -> str:
+        """
+        Reverse the trade direction.
+        """
+        return 'sell' if trade == 'buy' else 'buy'
+
+    def calculate_triangular_arbitrage_profit(self, prices: Dict[str, Decimal], trades: List[str], trade_amount_usd: float) -> float:
+        """
+        Calculate the potential profit percentage from a margin triangular arbitrage trade, starting with USD.
+        """
+        try:
+            current_amount_usd = Decimal(str(trade_amount_usd))
+
+            for symbol, trade in zip(prices.keys(), trades):
+                price = prices[symbol]
+                if trade == 'buy':
+                    # Convert USD to asset quantity
+                    quantity = current_amount_usd / price
+                    current_amount_usd = quantity  # Keep track of the quantity for the next trade
+                elif trade == 'sell':
+                    # Convert asset quantity to USD
+                    current_amount_usd = current_amount_usd * price
+
+            # Calculate profit percentage
+            profit_percentage = (float(current_amount_usd) / float(trade_amount_usd) - 1) * 100
+            return profit_percentage
+        except Exception as e:
+            logger.error(f"Error in profit calculation: {str(e)}")
+            logger.error(f"Prices: {prices}, Trades: {trades}, Trade amount USD: {trade_amount_usd}")
+            raise
+    
+            
+            
