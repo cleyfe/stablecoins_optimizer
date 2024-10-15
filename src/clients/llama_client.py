@@ -7,14 +7,21 @@ class LlamaClient:
 
     def __init__(self):
         self.llama_pools = {
-            'arb_usdc': 'd9fa8e14-0447-4207-9ae8-7810199dfa1f',
-            'arb_usdt': '3a6cc030-738d-4e19-8a40-e63e9c4d5a6f',
-            'arb_usdce': '7aab7b0f-01c1-4467-bc0d-77826d870f19',
-            'arb_dai': 'a8e3d841-2788-4647-ad54-5a36fac451b1',    
-            'pol_usdc': '1b8b4cdb-0728-42a8-bf13-2c8fea7427ee',
-            'pol_usdt': '7e7821a2-3d20-4ae7-9c3d-04cd57904555',
-            'pol_dai': 'c57bdc97-3100-41ff-845f-075363f6f5a4',
-            'pol_usdce': '37b04faa-95bb-4ccb-9c4e-c70fa167342b',
+            # protocol_chain_asset
+            'aave_arb_usdc': 'd9fa8e14-0447-4207-9ae8-7810199dfa1f',
+            'aave_arb_usdt': '3a6cc030-738d-4e19-8a40-e63e9c4d5a6f',
+            'aave_arb_usdce': '7aab7b0f-01c1-4467-bc0d-77826d870f19',
+            'aave_arb_dai': 'a8e3d841-2788-4647-ad54-5a36fac451b1',    
+            'aave_arb_eth': '',    
+            'aave_arb_weth': '',    
+            'aave_pol_usdc': '1b8b4cdb-0728-42a8-bf13-2c8fea7427ee',
+            'aave_pol_usdt': '7e7821a2-3d20-4ae7-9c3d-04cd57904555',
+            'aave_pol_dai': 'c57bdc97-3100-41ff-845f-075363f6f5a4',
+            'aave_pol_usdce': '37b04faa-95bb-4ccb-9c4e-c70fa167342b',
+
+            'comp_arb_usdc' : 'd9c395b9-00d0-4426-a6b3-572a6dd68e54',
+            'comp_pol_usdc' : 'a17d8b32-48cb-4446-aad7-ed4278f144e0',
+            'comp_eth_usdc' : '7da72d09-56ca-4ec5-a45f-59114353e487',
         }
 
     def fetch_pool_data(self, pool_name: str, pool_id: str) -> pd.DataFrame:
