@@ -3,6 +3,13 @@ from typing import Dict, Any
 import requests
 import json
 import time
+from datetime import datetime
+from moralis import evm_api
+import os
+from dotenv import load_dotenv
+from src.utils.constants import chain_map_moralis, RAY, SECONDS_PER_YEAR
+
+load_dotenv()
 
 def convert_to_decimal_units(decimals: int, token_amount: float) -> int:
     """Convert float amount to integer units based on token decimals."""
@@ -49,3 +56,21 @@ def from_ray(value: int) -> float:
 def from_market_base_ccy(value: int) -> float:
     """Convert a value from market base currency units (1e8) to a float."""
     return value / 10**8
+
+def get_block_number_from_date(dt: datetime, chain="eth") -> int:
+    """Get the block number associated with a specific datetime."""
+    params = {
+    "chain": chain,
+    "date": dt.isoformat(),
+    }
+    
+    result = evm_api.block.get_date_to_block(
+        api_key=os.getenv("MORALIS_API_KEY"),
+        params=params,
+    )
+
+    return result["block"]
+
+def ray_to_apy(ray_rate):
+    rate = float(ray_rate) / RAY
+    return ((1 + rate / SECONDS_PER_YEAR) ** SECONDS_PER_YEAR - 1) * 100

@@ -1,4 +1,6 @@
 import logging
+import pandas as pd
+import time
 from typing import Optional, Union, List, Dict, Any
 from web3 import Web3
 from web3._utils.encoding import HexBytes
@@ -7,9 +9,10 @@ from web3.middleware import geth_poa_middleware
 from dataclasses import dataclass
 from datetime import datetime
 import requests
+import concurrent
 from concurrent.futures import ThreadPoolExecutor
-
-from src.utils.web3_utils import convert_to_decimal_units, convert_from_decimal_units, get_abi
+from src.utils.constants import chain_map_moralis, RAY
+from src.utils.web3_utils import convert_to_decimal_units, convert_from_decimal_units, get_abi, get_block_number_from_date, ray_to_apy
 from src.utils.aave_utils import process_get_reserve_data_result, process_get_user_account_data_result
 from src.utils.abi_references import ABIReference
 
@@ -83,9 +86,10 @@ class PolygonConfig(BaseNetworkConfig):
                 pool_data = aave_client.get_pool_data(lending_pool, "getReserveData", token_address)
                 decimals = aave_client.get_protocol_data("getReserveConfigurationData", token_address)[0]
                 
+                symbol = token_symbols[token_address]
                 token_data = {
                     "aTokenAddress": pool_data["aTokenAddress"],
-                    "aTokenSymbol": None,  # This data might not be directly available
+                    "aTokenSymbol": f"a{symbol}",
                     "stableDebtTokenAddress": pool_data["stableDebtTokenAddress"],
                     "variableDebtTokenAddress": pool_data["variableDebtTokenAddress"],
                     "symbol": token_symbols[token_address],
@@ -134,9 +138,10 @@ class ArbitrumConfig(BaseNetworkConfig):
                 pool_data = aave_client.get_pool_data(lending_pool, "getReserveData", token_address)
                 decimals = aave_client.get_protocol_data("getReserveConfigurationData", token_address)[0]
                 
+                symbol = token_symbols[token_address]
                 token_data = {
                     "aTokenAddress": pool_data["aTokenAddress"],
-                    "aTokenSymbol": None,  # This data might not be directly available
+                    "aTokenSymbol": f"a{symbol}",
                     "stableDebtTokenAddress": pool_data["stableDebtTokenAddress"],
                     "variableDebtTokenAddress": pool_data["variableDebtTokenAddress"],
                     "symbol": token_symbols[token_address],
@@ -870,3 +875,200 @@ class AaveClient:
         """
         erc20 = self.w3.eth.contract(address=erc20_address, abi=ABIReference.erc20_abi)
         return erc20.functions.allowance(self.wallet_address, spender_address).call()
+
+    def get_rates_via_contract(self, 
+                                asset_address: str, 
+                                start_date: datetime,
+                                end_date: datetime, 
+                                time_interval_hours: int = 8) -> pd.DataFrame:
+        """
+        Fetch historical Aave rates directly from the contract for a specific asset using date range
+        
+        Parameters:
+            asset_address (str): Address of the asset to fetch rates for
+            start_date (datetime): Start date to fetch rates from
+            end_date (datetime): End date to fetch rates until
+            chain (str): Chain identifier for block fetching (default "arbitrum")
+            time_interval_hours (int): Hours between each rate check (default 4)
+        
+        The contract returns a tuple with these indices:
+            - [1]: liquidityIndex (27 decimals)
+            - [2]: currentLiquidityRate (27 decimals)
+            - [3]: variableBorrowIndex (27 decimals)
+            - [4]: currentVariableBorrowRate (27 decimals)
+            - [5]: currentStableBorrowRate (27 decimals)
+            - [6]: lastUpdateTimestamp
+        """
+        chain = chain_map_moralis.get(self.active_network.net_name)
+        # Get start and end blocks from dates
+        start_block = get_block_number_from_date(start_date, chain)
+        end_block = get_block_number_from_date(end_date, chain)
+        
+        if not start_block or not end_block:
+            raise Exception("Could not determine block numbers from dates")
+        
+        logger.info(f"Fetching rates from {start_date} (block {start_block}) to {end_date} (block {end_block})")
+        
+        # Calculate block step based on time interval
+        # Arbitrum: ~1 block every 0.25 seconds = ~14,400 blocks per hour
+        # Ethereum: ~1 block every 12 seconds = ~300 blocks per hour
+        # Polygon: ~1 block every 2 seconds = ~1800 blocks per hour
+        # Base: ~1 block every 2 seconds = ~1800 blocks per hour
+        blocks_per_hour = 14400 if self.active_network.net_name == "Arbitrum" else 300
+        block_step = blocks_per_hour * time_interval_hours
+        
+        rates_data = []
+        lending_pool = self.get_lending_pool()
+        
+        # Process blocks in batches to handle RPC rate limits
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            def fetch_block_data(block):
+                try:
+                    # Get reserve data for the specific block
+                    function_call = lending_pool.functions.getReserveData(
+                        self.w3.to_checksum_address(asset_address)
+                    )
+                    
+                    # Execute the call with the specific block
+                    result = function_call.call(block_identifier=block)
+                    
+                    # Get block timestamp
+                    block_data = self.w3.eth.get_block(block)
+                    timestamp = block_data['timestamp']
+
+                    # Get indices from the tuple, with safety checks
+                    liquidity_rate = int(result[2]) if len(result) > 2 else 0
+                    stable_rate = int(result[5]) if len(result) > 5 else 0
+                    variable_rate = int(result[4]) if len(result) > 4 else 0
+                    
+                    # Calculate APYs
+                    supply_apy = ray_to_apy(liquidity_rate)
+                    stable_borrow_apy = ray_to_apy(stable_rate)
+                    variable_borrow_apy = ray_to_apy(variable_rate)
+                    
+                    # Calculate indices
+                    liquidity_index = float(result[1]) / RAY if len(result) > 1 else 0
+                    variable_borrow_index = float(result[3]) / RAY if len(result) > 3 else 0
+                    
+                    return {
+                        'block_number': block,
+                        'timestamp': timestamp,
+                        'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                        'supply_apy': supply_apy,
+                        'stable_borrow_apy': stable_borrow_apy,
+                        'variable_borrow_apy': variable_borrow_apy,
+                        'liquidity_index': liquidity_index,
+                        'variable_borrow_index': variable_borrow_index,
+                        'last_update_timestamp': int(result[6]) if len(result) > 6 else 0
+                    }
+                except Exception as e:
+                    if 'Result too large' in str(e):
+                        logger.warning(f"Block {block}: RPC response too large, skipping")
+                    else:
+                        logger.warning(f"Error fetching data for block {block}: {str(e)}")
+                    return None
+
+            # Create block numbers to query with larger steps to avoid RPC limits
+            blocks_to_query = list(range(start_block, end_block + 1, block_step))
+            
+            # Add the exact end block to get the most recent data
+            if end_block not in blocks_to_query:
+                blocks_to_query.append(end_block)
+            
+            # Submit all tasks
+            future_to_block = {executor.submit(fetch_block_data, block): block for block in blocks_to_query}
+            
+            # Process completed tasks
+            for future in concurrent.futures.as_completed(future_to_block):
+                block = future_to_block[future]
+                try:
+                    data = future.result()
+                    if data:
+                        rates_data.append(data)
+                except Exception as e:
+                    logger.warning(f"Error processing block {block}: {str(e)}")
+
+        # Convert to DataFrame and sort by block number
+        df = pd.DataFrame(rates_data)
+        if not df.empty:
+            df = df.sort_values('block_number').reset_index(drop=True)
+            
+            # Add some useful derived columns
+            df['utilization_rate'] = (df['variable_borrow_index'] / df['liquidity_index'] * 100)
+            
+            # Reorder columns for better readability
+            column_order = [
+                'datetime', 'block_number', 'timestamp', 'supply_apy', 
+                'stable_borrow_apy', 'variable_borrow_apy', 'utilization_rate',
+                'liquidity_index', 'variable_borrow_index', 'last_update_timestamp'
+            ]
+            df = df[column_order]
+        
+        return df
+    
+    def fetch_multi_asset_rates_via_contract(self, 
+                            asset_symbols=['USDCE', 'USDC', 'USDT', 'DAI'],
+                            start_date: datetime = None,
+                            end_date: datetime = None,
+                            time_interval_hours: int = 8) -> pd.DataFrame:
+        """
+        Fetch rates for multiple assets using the existing get_rates_via_contract function
+        and combine them into a single DataFrame.
+        """
+        all_rates = {}
+        
+        for symbol in asset_symbols:
+            try:
+                token = self.get_reserve_token(symbol)
+                if token is None:
+                    print(f"Warning: Could not find token {symbol}, skipping...")
+                    continue
+                    
+                print(f"Fetching rates for {symbol}...")
+                rates = self.get_rates_via_contract(
+                    asset_address=token.address,
+                    start_date=start_date,
+                    end_date=end_date,
+                    time_interval_hours=time_interval_hours
+                )
+                
+                if not rates.empty:
+                    # Store the rates with the asset symbol
+                    all_rates[symbol] = rates
+                    print(f"Successfully fetched rates for {symbol}")
+
+                time.sleep(2)  # 2 second delay between assets
+                
+            except Exception as e:
+                print(f"Error fetching rates for {symbol}: {str(e)}")
+        
+        if not all_rates:
+            raise ValueError("No rate data was successfully fetched for any asset")
+        
+        # Combine all rates into one DataFrame
+        combined_data = []
+        
+        for symbol, rates_df in all_rates.items():
+            # Add asset symbol to column names except datetime/timestamp/block
+            asset_data = rates_df.copy()
+            rename_cols = {
+                col: f"{symbol}_{col}" 
+                for col in asset_data.columns 
+                if col not in ['datetime', 'timestamp', 'block_number']
+            }
+            asset_data = asset_data.rename(columns=rename_cols)
+            combined_data.append(asset_data)
+        
+        # Merge all DataFrames
+        final_df = combined_data[0]
+        for df in combined_data[1:]:
+            final_df = pd.merge(final_df, 
+                            df, 
+                            on=['datetime', 'timestamp', 'block_number'], 
+                            how='outer')
+        
+        # Sort by timestamp
+        final_df = final_df.sort_values('timestamp').reset_index(drop=True)
+        
+        return final_df
+

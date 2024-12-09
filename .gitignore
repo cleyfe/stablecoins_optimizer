@@ -155,4 +155,5 @@ cython_debug/
 #.idea/
 
 *.ipynb
-/testing/*.ipynb
+/use_cases/*.ipynb
+/use_cases/*.csv
