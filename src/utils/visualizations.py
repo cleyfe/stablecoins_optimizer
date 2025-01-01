@@ -291,7 +291,7 @@ def create_strategy_plots(results_df, window=42):
         go.Scatter(
             x=results_df['datetime'],
             y=rate_ma,
-            name='7-day MA Supply Rate',
+            name='7-day MA Annualized Rate',
             line=dict(color='darkblue', dash='dash')
         )
     )
