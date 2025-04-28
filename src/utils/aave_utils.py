@@ -275,6 +275,7 @@ def backtest_enhanced_strategy(data_df, LTV=0.9, initial_collateral=10000, stop_
         results.loc[0, 'position_value_after_costs'] = float(initial_collateral)
     
     # Simulate strategy
+    current_spread = 0.0 # Default value
     for i in range(1, len(results)):
         # Default carry forward of current position and status
         results.loc[i, 'current_supply_asset'] = results.iloc[i-1]['current_supply_asset']
@@ -284,11 +285,11 @@ def backtest_enhanced_strategy(data_df, LTV=0.9, initial_collateral=10000, stop_
         results.loc[i, 'transaction_count'] = 0
         
         # Get latest rates and spread for current position if it exists
-        if results.iloc[i-1]['current_supply_asset'] is not None:
+        if results.iloc[i-1]['current_supply_asset'] is not None and not pd.isna(results.iloc[i-1]['current_supply_asset']):
             current_supply_rate = data_df.loc[i, f"{results.iloc[i-1]['current_supply_asset']}_supply_apy"]
             results.loc[i, 'current_supply_rate'] = float(current_supply_rate)
             
-            if results.iloc[i-1]['current_borrow_asset'] is not None:
+            if results.iloc[i-1]['current_borrow_asset'] is not None and not pd.isna(results.iloc[i-1]['current_borrow_asset']):
                 current_borrow_rate = data_df.loc[i, f"{results.iloc[i-1]['current_borrow_asset']}_variable_borrow_apy"]
                 results.loc[i, 'current_borrow_rate'] = float(current_borrow_rate)
                 current_spread = current_supply_rate - current_borrow_rate

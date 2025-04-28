@@ -1037,7 +1037,7 @@ class AaveClient:
                     all_rates[symbol] = rates
                     print(f"Successfully fetched rates for {symbol}")
 
-                time.sleep(2)  # 2 second delay between assets
+                time.sleep(1)  # 1 second delay between assets
                 
             except Exception as e:
                 print(f"Error fetching rates for {symbol}: {str(e)}")

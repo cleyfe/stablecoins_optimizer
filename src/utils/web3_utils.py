@@ -8,6 +8,7 @@ from moralis import evm_api
 import os
 from dotenv import load_dotenv
 from src.utils.constants import chain_map_moralis, RAY, SECONDS_PER_YEAR
+import time
 
 load_dotenv()
 
@@ -59,6 +60,7 @@ def from_market_base_ccy(value: int) -> float:
 
 def get_block_number_from_date(dt: datetime, chain="eth") -> int:
     """Get the block number associated with a specific datetime."""
+    time.sleep(1)
     params = {
     "chain": chain,
     "date": dt.isoformat(),
